@@ -6,8 +6,8 @@ const { Timestamp } = require("firebase-admin/firestore");
 const { GoogleAuth } = require("google-auth-library");
 const path = require("path");
 
-// Load service account từ file (hoặc từ env nếu cần)
-const serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
+// Parse chuỗi JSON từ .env
+const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
 // Khởi tạo Firebase Admin
 admin.initializeApp({
