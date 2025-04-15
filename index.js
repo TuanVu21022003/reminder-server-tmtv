@@ -4,10 +4,12 @@ const fetch = require("node-fetch");
 const cron = require("node-cron");
 const { Timestamp } = require("firebase-admin/firestore");
 const { GoogleAuth } = require("google-auth-library");
+const path = require("path");
 
-// Khởi tạo Firebase Admin SDK
-const serviceAccount = require("./serviceAccountKey.json");
+// Load service account từ file (hoặc từ env nếu cần)
+const serviceAccount = require(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
+// Khởi tạo Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
@@ -26,20 +28,15 @@ const getAccessToken = async () => {
   return accessTokenResponse.token;
 };
 
-/**
- * Gửi thông báo FCM (sử dụng FCM HTTP v1)
- */
+// Gửi FCM
 const sendNotification = async (token, title, body) => {
   try {
     const accessToken = await getAccessToken();
 
     const message = {
       message: {
-        token: token,
-        notification: {
-          title: title,
-          body: body,
-        },
+        token,
+        notification: { title, body },
       },
     };
 
@@ -58,21 +55,16 @@ const sendNotification = async (token, title, body) => {
     const data = await response.json();
     console.log("✅ Gửi thông báo thành công:", data);
   } catch (error) {
-    console.error("❌ Lỗi gửi thông báo:", error);
+    console.error("❌ Gửi thông báo thất bại:", error.message);
   }
 };
 
-/**
- * Kiểm tra các nhắc nhở gần đến hạn
- */
+// Nhắc nhở không lặp
 const checkRemindersNoRepeat = async () => {
   const now = new Date();
-  const timeNotifyPre = 30
-  const time1 = new Date(now.getTime() + (timeNotifyPre - 1) * 60 * 1000);
-  const time2 = new Date(now.getTime() + (timeNotifyPre + 1) * 60 * 1000);
-
-  console.log(time1)
-  console.log(time2)
+  const preMinutes = Number(process.env.NOTIFY_BEFORE_MINUTES || 30);
+  const time1 = new Date(now.getTime() + (preMinutes - 1) * 60000);
+  const time2 = new Date(now.getTime() + (preMinutes + 1) * 60000);
 
   try {
     const snapshot = await db.collection("reminders")
@@ -81,114 +73,90 @@ const checkRemindersNoRepeat = async () => {
       .where("is_recurring", "==", false)
       .get();
 
-    if (snapshot.empty) {
-      console.log(`🟡 Không có nhắc nhở nào trong ${timeNotifyPre} phút tới.`);
-      return;
-    }
+    if (snapshot.empty) return;
 
-    snapshot.forEach(async (doc) => {
+    for (const doc of snapshot.docs) {
       const reminder = doc.data();
-      const userId = reminder.user_id;
-      const title = reminder.title || "Thông báo";
-      const body = reminder.description || "Bạn có nhắc nhở!";
-
-      const userDoc = await db.collection("users").doc(userId).get();
+      const userDoc = await db.collection("users").doc(reminder.user_id).get();
       const token = userDoc.data()?.fcm_token;
 
-      console.log(reminder);
-
-      if (token && !reminder.is_recurring) {
-        await sendNotification(token, title, body);
-      } else {
-        console.log(`⚠️ Không tìm thấy FCM token cho user_id: ${userId}`);
+      if (token) {
+        await sendNotification(
+          token,
+          reminder.title || "Thông báo",
+          reminder.description || "Bạn có nhắc nhở!"
+        );
       }
-    });
-  } catch (error) {
-    console.error("❌ Lỗi khi truy vấn Firestore:", error);
+    }
+  } catch (err) {
+    console.error("❌ Lỗi Firestore:", err.message);
   }
 };
 
+// Nhắc nhở lặp lại
 const checkRemindersWithRepeat = async () => {
   const now = new Date();
-  const timeNotifyPre = 30; // phút trước khi đến thời gian nhắc
+  const preMinutes = Number(process.env.NOTIFY_BEFORE_MINUTES || 30);
+  const target = new Date(now.getTime() + preMinutes * 60000);
 
-  // Thời điểm sẽ chạy nhắc (thời điểm thực tế user set)
-  const notifyTarget = new Date(now.getTime() + timeNotifyPre * 60 * 1000);
-  const targetHour = notifyTarget.getHours();
-  const targetMinute = notifyTarget.getMinutes();
-  const targetDay = notifyTarget.getDay();    // 0: Chủ nhật, ..., 6: Thứ 7
-  const targetDate = notifyTarget.getDate();  // Ngày trong tháng
+  const hour = target.getHours();
+  const minute = target.getMinutes();
+  const day = target.getDay(); // 0-6
+  const date = target.getDate(); // 1-31
 
   try {
     const snapshot = await db.collection("reminders")
       .where("is_recurring", "==", true)
       .get();
 
-    if (snapshot.empty) {
-      console.log("🟡 Không có nhắc nhở lặp lại.");
-      return;
-    }
+    if (snapshot.empty) return;
 
-    snapshot.forEach(async (doc) => {
+    for (const doc of snapshot.docs) {
       const reminder = doc.data();
       const remindTime = reminder.remind_at?.toDate();
-      if (!remindTime) return;
+      if (!remindTime) continue;
 
-      const remindHour = remindTime.getHours();
-      const remindMinute = remindTime.getMinutes();
-      const remindDay = remindTime.getDay();
-      const remindDate = remindTime.getDate();
-
-      const pattern = reminder.recurrence_pattern;
-      let match = false;
-
-      switch (pattern) {
-        case "Hằng ngày":
-          match = (remindHour === targetHour && remindMinute === targetMinute);
-          break;
-        case "Hằng tuần":
-          match = (
-            targetDay === remindDay &&
-            remindHour === targetHour &&
-            remindMinute === targetMinute
-          );
-          break;
-        case "Hằng tháng":
-          match = (
-            targetDate === remindDate &&
-            remindHour === targetHour &&
-            remindMinute === targetMinute
-          );
-          break;
-        default:
-          break;
-      }
+      const match = (() => {
+        const rh = remindTime.getHours();
+        const rm = remindTime.getMinutes();
+        const rd = remindTime.getDay();
+        const rdate = remindTime.getDate();
+        switch (reminder.recurrence_pattern) {
+          case "Hằng ngày": return rh === hour && rm === minute;
+          case "Hằng tuần": return rh === hour && rm === minute && rd === day;
+          case "Hằng tháng": return rh === hour && rm === minute && rdate === date;
+          default: return false;
+        }
+      })();
 
       if (match) {
-        const userId = reminder.user_id;
-        const title = reminder.title || "Thông báo";
-        const body = reminder.description || "Bạn có nhắc nhở (lặp lại)!";
-
-        const userDoc = await db.collection("users").doc(userId).get();
+        const userDoc = await db.collection("users").doc(reminder.user_id).get();
         const token = userDoc.data()?.fcm_token;
-
-        console.log("🔁 Reminder lặp lại:", reminder);
-
         if (token) {
-          await sendNotification(token, title, body);
-        } else {
-          console.log(`⚠️ Không tìm thấy FCM token cho user_id: ${userId}`);
+          await sendNotification(
+            token,
+            reminder.title || "Thông báo",
+            reminder.description || "Bạn có nhắc nhở lặp lại!"
+          );
         }
       }
-    });
-  } catch (error) {
-    console.error("❌ Lỗi khi xử lý nhắc nhở lặp lại:", error);
+    }
+  } catch (err) {
+    console.error("❌ Lỗi nhắc nhở lặp:", err.message);
   }
 };
 
-// Lập lịch chạy mỗi phút
+// Cron chạy mỗi phút
 cron.schedule("* * * * *", () => {
-  console.log("🕐 Kiểm tra nhắc nhở...");
+  console.log("🕐 Đang kiểm tra nhắc nhở...");
   checkRemindersNoRepeat();
   checkRemindersWithRepeat();
+});
+
+// Tùy chọn: server express (nếu cần giữ app "alive" trên hosting)
+const express = require("express");
+const app = express();
+app.get("/", (req, res) => res.send("Reminder Server đang chạy..."));
+app.listen(process.env.PORT || 3000, () => {
+  console.log("🚀 Reminder server đã sẵn sàng!");
 });
