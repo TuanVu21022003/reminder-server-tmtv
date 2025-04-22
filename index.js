@@ -1,22 +1,14 @@
+// main.js
 require("dotenv").config();
-const admin = require("firebase-admin");
 const fetch = require("node-fetch");
 const cron = require("node-cron");
 const { Timestamp } = require("firebase-admin/firestore");
 const { GoogleAuth } = require("google-auth-library");
-const path = require("path");
+const { db } = require('./firebase');  // Import Firebase db connection
+const { createNotificationReminder, sendNotificationFC } = require('./notificationService');  // Import Notification Service
 
-// Parse chuỗi JSON từ .env
 const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
-// Khởi tạo Firebase Admin
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-const db = admin.firestore();
-
-// Lấy access token từ service account
 const getAccessToken = async () => {
   const auth = new GoogleAuth({
     credentials: serviceAccount,
@@ -28,8 +20,7 @@ const getAccessToken = async () => {
   return accessTokenResponse.token;
 };
 
-// Gửi FCM
-const sendNotification = async (token, title, body) => {
+const sendNotification = async (token, title, body, user_email, reminder_id, reminder) => {
   try {
     const accessToken = await getAccessToken();
 
@@ -37,6 +28,11 @@ const sendNotification = async (token, title, body) => {
       message: {
         token,
         notification: { title, body },
+        data: {
+          type: "reminder", 
+          user_email: user_email || "",
+          reminder_id: reminder_id
+        },
       },
     };
 
@@ -53,16 +49,19 @@ const sendNotification = async (token, title, body) => {
     );
 
     const data = await response.json();
-    console.log("✅ Gửi thông báo thành công:", data);
+    console.log(`✅ Gửi thông báo thành công: ${title} | ${body} | ${user_email}`);
+
+    // Tạo thông báo trên Firestore
+    await createNotificationReminder(reminder);  // Lưu vào Firestore
   } catch (error) {
     console.error("❌ Gửi thông báo thất bại:", error.message);
   }
 };
 
-// Nhắc nhở không lặp
-const checkRemindersNoRepeat = async () => {
+// Kiểm tra nhắc nhở không lặp
+const checkRemindersNoRepeat = async (time) => {
   const now = new Date();
-  const preMinutes = Number(process.env.NOTIFY_BEFORE_MINUTES || 30);
+  const preMinutes = Number(time);
   const time1 = new Date(now.getTime() + (preMinutes - 1) * 60000);
   const time2 = new Date(now.getTime() + (preMinutes + 1) * 60000);
 
@@ -84,7 +83,10 @@ const checkRemindersNoRepeat = async () => {
         await sendNotification(
           token,
           reminder.title || "Thông báo",
-          reminder.description || "Bạn có nhắc nhở!"
+          reminder.description || "Bạn có nhắc nhở!",
+          userDoc.data()?.email,
+          reminder.id,
+          reminder
         );
       }
     }
@@ -101,8 +103,8 @@ const checkRemindersWithRepeat = async () => {
 
   const hour = target.getHours();
   const minute = target.getMinutes();
-  const day = target.getDay(); // 0-6
-  const date = target.getDate(); // 1-31
+  const day = target.getDay();
+  const date = target.getDate();
 
   try {
     const snapshot = await db.collection("reminders")
@@ -136,7 +138,10 @@ const checkRemindersWithRepeat = async () => {
           await sendNotification(
             token,
             reminder.title || "Thông báo",
-            reminder.description || "Bạn có nhắc nhở lặp lại!"
+            reminder.description || "Bạn có nhắc nhở lặp lại!",
+            userDoc.data()?.email,
+            reminder.id,
+            reminder
           );
         }
       }
@@ -149,7 +154,8 @@ const checkRemindersWithRepeat = async () => {
 // Cron chạy mỗi phút
 cron.schedule("* * * * *", () => {
   console.log("🕐 Đang kiểm tra nhắc nhở...");
-  checkRemindersNoRepeat();
+  checkRemindersNoRepeat(0);
+  checkRemindersNoRepeat(process.env.NOTIFY_BEFORE_MINUTES || 30);
   checkRemindersWithRepeat();
 });
 
